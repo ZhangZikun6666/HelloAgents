@@ -328,6 +328,11 @@ class SimpleAgent(Agent):
         """检查是否有可用工具"""
         return self.enable_tool_calling and self.tool_registry is not None
 
+    def _save_exchange(self, input_text: str, response_text: str) -> None:
+        """把一轮问答写入历史记录。"""
+        self.add_message(Message(input_text, "user"))
+        self.add_message(Message(response_text, "assistant"))
+
     def stream_run(self, input_text: str, **kwargs) -> Iterator[str]:
         """
         流式运行Agent
@@ -352,13 +357,24 @@ class SimpleAgent(Agent):
         
         # 流式调用LLM
         full_response = ""
-        for chunk in self.llm.stream_invoke(messages, **kwargs):
-            full_response += chunk
-            yield chunk
-        
-        # 保存完整对话到历史记录
-        self.add_message(Message(input_text, "user"))
-        self.add_message(Message(full_response, "assistant"))
+        saved = False
+        try:
+            for chunk in self.llm.stream_invoke(messages, **kwargs):
+                full_response += chunk
+                yield chunk
+
+            # 先落库再结束，避免调用方提前退出时整轮丢失
+            self._save_exchange(input_text, full_response)
+            saved = True
+
+        finally:
+            # 中途断开时保留已收到的部分
+            if not saved and full_response:
+                try:
+                    self._save_exchange(input_text, full_response)
+                except Exception:
+                    # 不掩盖原始异常
+                    pass
 
     async def arun_stream(
         self,
@@ -390,6 +406,9 @@ class SimpleAgent(Agent):
             input_text=input_text
         )
 
+        full_response = ""
+        saved = False
+
         try:
             # 构建消息列表
             messages = []
@@ -403,7 +422,6 @@ class SimpleAgent(Agent):
             messages.append({"role": "user", "content": input_text})
 
             # LLM 流式调用
-            full_response = ""
             async for chunk in self.llm.astream_invoke(messages, **kwargs):
                 full_response += chunk
 
@@ -414,16 +432,16 @@ class SimpleAgent(Agent):
                     chunk=chunk
                 )
 
+            # 先落库再发完成事件，避免调用方收到 AGENT_FINISH 后退出导致整轮丢失
+            self._save_exchange(input_text, full_response)
+            saved = True
+
             # 发送完成事件
             yield StreamEvent.create(
                 StreamEventType.AGENT_FINISH,
                 self.name,
                 result=full_response
             )
-
-            # 保存到历史
-            self.add_message(Message(input_text, "user"))
-            self.add_message(Message(full_response, "assistant"))
 
         except Exception as e:
             # 发送错误事件
@@ -434,3 +452,11 @@ class SimpleAgent(Agent):
                 error_type=type(e).__name__
             )
             raise
+        finally:
+            # 中途断开时保留已收到的部分
+            if not saved and full_response:
+                try:
+                    self._save_exchange(input_text, full_response)
+                except Exception:
+                    # 不掩盖原始异常
+                    pass
